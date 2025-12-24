@@ -1,8 +1,7 @@
 services:
-  - type: worker
+  - type: web
     name: arbitrage-telegram-bot
     runtime: python
-    plan: background
-    pythonVersion: 3.11
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
