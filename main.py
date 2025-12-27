@@ -23,14 +23,13 @@ if not BOT_TOKEN or not CHAT_ID:
 bot = Bot(token=BOT_TOKEN)
 
 # ================== SETTINGS ==================
-MIN_DIFF = 0.5            # USD difference
-MIN_VOLUME = 1_000_000    # USDT 24h volume
-CHECK_INTERVAL = 15       # seconds
-MAX_ALERTS_PER_COIN = 1   # prevent spam
+MIN_DIFF = 0.5
+MIN_VOLUME = 1_000_000
+CHECK_INTERVAL = 15
 
 running = False
 worker_thread = None
-sent_cache = {}  # coin -> last alert timestamp
+sent_cache = {}
 
 # ================== FLASK ==================
 app = Flask(__name__)
@@ -39,8 +38,21 @@ app = Flask(__name__)
 def home():
     return "Arbitrage bot running", 200
 
+# ================== UI ==================
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start Bot", callback_data="start")],
+        [InlineKeyboardButton("⏹ Stop Bot", callback_data="stop")]
+    ])
+
+def back_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back", callback_data="back")]
+    ])
+
 # ================== EXCHANGE FETCH ==================
 def fetch_bybit_spot():
+    print("[CRAWL] Fetching Bybit spot tickers...")
     url = "https://api.bybit.com/v5/market/tickers?category=spot"
     r = requests.get(url, timeout=10).json()
 
@@ -54,13 +66,14 @@ def fetch_bybit_spot():
         if volume < MIN_VOLUME:
             continue
 
-        price = float(item["lastPrice"])
-        prices[symbol] = price
+        prices[symbol] = float(item["lastPrice"])
 
+    print(f"[CRAWL] Bybit valid pairs: {len(prices)}")
     return prices
 
 
 def fetch_bitget_spot():
+    print("[CRAWL] Fetching Bitget spot tickers...")
     url = "https://api.bitget.com/api/v2/spot/market/tickers"
     r = requests.get(url, timeout=10).json()
 
@@ -74,14 +87,16 @@ def fetch_bitget_spot():
         if volume < MIN_VOLUME:
             continue
 
-        price = float(item["lastPr"])
-        prices[symbol] = price
+        prices[symbol] = float(item["lastPr"])
 
+    print(f"[CRAWL] Bitget valid pairs: {len(prices)}")
     return prices
 
 # ================== ARBITRAGE LOOP ==================
 def arbitrage_loop():
     global running, sent_cache
+
+    print("[BOT] Arbitrage loop started")
 
     while running:
         try:
@@ -89,7 +104,9 @@ def arbitrage_loop():
             bitget = fetch_bitget_spot()
 
             common_coins = set(bybit.keys()) & set(bitget.keys())
+            print(f"[SCAN] Common coins: {len(common_coins)}")
 
+            found = 0
             for coin in common_coins:
                 p1 = bybit[coin]
                 p2 = bitget[coin]
@@ -99,10 +116,7 @@ def arbitrage_loop():
                     continue
 
                 now = time.time()
-                last_sent = sent_cache.get(coin, 0)
-
-                # avoid repeated spam
-                if now - last_sent < 300:
+                if now - sent_cache.get(coin, 0) < 300:
                     continue
 
                 buy = "Bybit" if p1 < p2 else "Bitget"
@@ -110,38 +124,38 @@ def arbitrage_loop():
 
                 message = (
                     "🚨 *SPOT ARBITRAGE OPPORTUNITY*\n\n"
-                    f"🪙 Coin: `{coin}`\n\n"
-                    f"📉 Buy on: *{buy}*\n"
-                    f"📈 Sell on: *{sell}*\n\n"
-                    f"💰 Bybit Price: `{p1}`\n"
-                    f"💰 Bitget Price: `{p2}`\n\n"
-                    f"📊 Difference: *${diff:.2f}*\n"
-                    f"⏱ Checked every {CHECK_INTERVAL}s"
+                    f"🪙 `{coin}`\n"
+                    f"📉 Buy: *{buy}*\n"
+                    f"📈 Sell: *{sell}*\n\n"
+                    f"💰 Bybit: `{p1}`\n"
+                    f"💰 Bitget: `{p2}`\n"
+                    f"📊 Difference: *${diff:.2f}*"
                 )
 
                 bot.send_message(
                     chat_id=CHAT_ID,
                     text=message,
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=back_menu()
                 )
 
                 sent_cache[coin] = now
+                found += 1
 
+            print(f"[SCAN] Opportunities found: {found}")
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            print("Arbitrage error:", e)
+            print("[ERROR] Arbitrage error:", e)
             time.sleep(5)
+
+    print("[BOT] Arbitrage loop stopped")
 
 # ================== TELEGRAM ==================
 def start(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("▶️ Start Bot", callback_data="start")],
-        [InlineKeyboardButton("⏹ Stop Bot", callback_data="stop")]
-    ]
     update.message.reply_text(
         "🤖 *Arbitrage Bot Control Panel*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=main_menu(),
         parse_mode="Markdown"
     )
 
@@ -152,16 +166,20 @@ def button_handler(update: Update, context: CallbackContext):
 
     if query.data == "start" and not running:
         running = True
-        worker_thread = threading.Thread(
-            target=arbitrage_loop,
-            daemon=True
-        )
+        worker_thread = threading.Thread(target=arbitrage_loop, daemon=True)
         worker_thread.start()
-        query.edit_message_text("✅ Arbitrage bot started")
+        query.edit_message_text("✅ Arbitrage bot started", reply_markup=main_menu())
 
     elif query.data == "stop":
         running = False
-        query.edit_message_text("⏹ Arbitrage bot stopped")
+        query.edit_message_text("⏹ Arbitrage bot stopped", reply_markup=main_menu())
+
+    elif query.data == "back":
+        query.edit_message_text(
+            "🤖 *Arbitrage Bot Control Panel*",
+            reply_markup=main_menu(),
+            parse_mode="Markdown"
+        )
 
 # ================== MAIN ==================
 def main():
@@ -172,6 +190,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(button_handler))
 
     updater.start_polling()
+    print("[BOT] Telegram polling started")
 
     app.run(
         host="0.0.0.0",
