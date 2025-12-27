@@ -10,26 +10,22 @@ from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, Callback
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-
-BITGET_API_KEY = os.getenv("BITGET_API_KEY")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
-
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
 bot = Bot(token=BOT_TOKEN)
 
 # ================== SETTINGS ==================
-MIN_DIFF = 0.5
-MIN_VOLUME = 1_000_000
-CHECK_INTERVAL = 15
+MIN_DIFF = 0.5          # USD difference
+CHECK_INTERVAL = 30     # seconds (safe for Bybit)
+ALERT_COOLDOWN = 300    # seconds per coin
+API_ALERT_COOLDOWN = 600
 
 running = False
 worker_thread = None
-sent_cache = {}
+
+sent_cache = {}         # coin -> timestamp
+api_alert_cache = {}   # exchange -> timestamp
 
 # ================== FLASK ==================
 app = Flask(__name__)
@@ -38,63 +34,91 @@ app = Flask(__name__)
 def home():
     return "Arbitrage bot running", 200
 
-# ================== UI ==================
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Start Bot", callback_data="start")],
-        [InlineKeyboardButton("⏹ Stop Bot", callback_data="stop")]
-    ])
+# ================== UTIL ==================
+def api_block_alert(exchange, message):
+    now = time.time()
+    last = api_alert_cache.get(exchange, 0)
 
-def back_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back", callback_data="back")]
-    ])
+    if now - last < API_ALERT_COOLDOWN:
+        return
+
+    bot.send_message(
+        chat_id=CHAT_ID,
+        text=f"⚠️ *{exchange} API ISSUE*\n\n{message}",
+        parse_mode="Markdown"
+    )
+
+    api_alert_cache[exchange] = now
 
 # ================== EXCHANGE FETCH ==================
 def fetch_bybit_spot():
     print("[CRAWL] Fetching Bybit spot tickers...")
     url = "https://api.bybit.com/v5/market/tickers?category=spot"
-    r = requests.get(url, timeout=10).json()
+
+    try:
+        r = requests.get(url, timeout=10)
+    except Exception as e:
+        print("[ERROR] Bybit request failed:", e)
+        api_block_alert("Bybit", "Request failed / network error")
+        return {}
+
+    if r.status_code != 200:
+        print("[ERROR] Bybit HTTP:", r.status_code)
+        api_block_alert("Bybit", f"HTTP {r.status_code}")
+        return {}
+
+    try:
+        data = r.json()
+    except Exception:
+        print("[ERROR] Bybit returned non-JSON (blocked or rate-limited)")
+        api_block_alert("Bybit", "Returned non-JSON response (rate-limit or block)")
+        return {}
 
     prices = {}
-    for item in r.get("result", {}).get("list", []):
-        symbol = item["symbol"]
-        if not symbol.endswith("USDT"):
-            continue
+    for item in data.get("result", {}).get("list", []):
+        symbol = item.get("symbol", "")
+        if symbol.endswith("USDT"):
+            prices[symbol] = float(item["lastPrice"])
 
-        volume = float(item.get("turnover24h", 0))
-        if volume < MIN_VOLUME:
-            continue
-
-        prices[symbol] = float(item["lastPrice"])
-
-    print(f"[CRAWL] Bybit valid pairs: {len(prices)}")
+    print(f"[OK] Bybit fetched {len(prices)} coins")
     return prices
 
 
 def fetch_bitget_spot():
     print("[CRAWL] Fetching Bitget spot tickers...")
     url = "https://api.bitget.com/api/v2/spot/market/tickers"
-    r = requests.get(url, timeout=10).json()
+
+    try:
+        r = requests.get(url, timeout=10)
+    except Exception as e:
+        print("[ERROR] Bitget request failed:", e)
+        api_block_alert("Bitget", "Request failed / network error")
+        return {}
+
+    if r.status_code != 200:
+        print("[ERROR] Bitget HTTP:", r.status_code)
+        api_block_alert("Bitget", f"HTTP {r.status_code}")
+        return {}
+
+    try:
+        data = r.json()
+    except Exception:
+        print("[ERROR] Bitget returned non-JSON")
+        api_block_alert("Bitget", "Returned non-JSON response")
+        return {}
 
     prices = {}
-    for item in r.get("data", []):
-        symbol = item["symbol"]
-        if not symbol.endswith("USDT"):
-            continue
+    for item in data.get("data", []):
+        symbol = item.get("symbol", "")
+        if symbol.endswith("USDT"):
+            prices[symbol] = float(item["lastPr"])
 
-        volume = float(item.get("usdtVolume", 0))
-        if volume < MIN_VOLUME:
-            continue
-
-        prices[symbol] = float(item["lastPr"])
-
-    print(f"[CRAWL] Bitget valid pairs: {len(prices)}")
+    print(f"[OK] Bitget fetched {len(prices)} coins")
     return prices
 
 # ================== ARBITRAGE LOOP ==================
 def arbitrage_loop():
-    global running, sent_cache
+    global running
 
     print("[BOT] Arbitrage loop started")
 
@@ -103,11 +127,9 @@ def arbitrage_loop():
             bybit = fetch_bybit_spot()
             bitget = fetch_bitget_spot()
 
-            common_coins = set(bybit.keys()) & set(bitget.keys())
-            print(f"[SCAN] Common coins: {len(common_coins)}")
+            common = set(bybit) & set(bitget)
 
-            found = 0
-            for coin in common_coins:
+            for coin in common:
                 p1 = bybit[coin]
                 p2 = bitget[coin]
                 diff = abs(p1 - p2)
@@ -116,46 +138,44 @@ def arbitrage_loop():
                     continue
 
                 now = time.time()
-                if now - sent_cache.get(coin, 0) < 300:
+                if now - sent_cache.get(coin, 0) < ALERT_COOLDOWN:
                     continue
 
                 buy = "Bybit" if p1 < p2 else "Bitget"
                 sell = "Bitget" if buy == "Bybit" else "Bybit"
 
-                message = (
-                    "🚨 *SPOT ARBITRAGE OPPORTUNITY*\n\n"
-                    f"🪙 `{coin}`\n"
+                msg = (
+                    "🚨 *SPOT ARBITRAGE FOUND*\n\n"
+                    f"🪙 `{coin}`\n\n"
                     f"📉 Buy: *{buy}*\n"
                     f"📈 Sell: *{sell}*\n\n"
                     f"💰 Bybit: `{p1}`\n"
-                    f"💰 Bitget: `{p2}`\n"
-                    f"📊 Difference: *${diff:.2f}*"
+                    f"💰 Bitget: `{p2}`\n\n"
+                    f"📊 Diff: *${diff:.2f}*"
                 )
 
-                bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=message,
-                    parse_mode="Markdown",
-                    reply_markup=back_menu()
-                )
-
+                bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
                 sent_cache[coin] = now
-                found += 1
 
-            print(f"[SCAN] Opportunities found: {found}")
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            print("[ERROR] Arbitrage error:", e)
+            print("[ERROR] Arbitrage loop error:", e)
             time.sleep(5)
 
     print("[BOT] Arbitrage loop stopped")
 
-# ================== TELEGRAM ==================
+# ================== TELEGRAM UI ==================
+def menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start Bot", callback_data="start")],
+        [InlineKeyboardButton("⏹ Stop Bot", callback_data="stop")]
+    ])
+
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "🤖 *Arbitrage Bot Control Panel*",
-        reply_markup=main_menu(),
+        reply_markup=menu_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -168,18 +188,11 @@ def button_handler(update: Update, context: CallbackContext):
         running = True
         worker_thread = threading.Thread(target=arbitrage_loop, daemon=True)
         worker_thread.start()
-        query.edit_message_text("✅ Arbitrage bot started", reply_markup=main_menu())
+        query.edit_message_text("✅ Bot started", reply_markup=menu_keyboard())
 
     elif query.data == "stop":
         running = False
-        query.edit_message_text("⏹ Arbitrage bot stopped", reply_markup=main_menu())
-
-    elif query.data == "back":
-        query.edit_message_text(
-            "🤖 *Arbitrage Bot Control Panel*",
-            reply_markup=main_menu(),
-            parse_mode="Markdown"
-        )
+        query.edit_message_text("⏹ Bot stopped", reply_markup=menu_keyboard())
 
 # ================== MAIN ==================
 def main():
@@ -192,10 +205,7 @@ def main():
     updater.start_polling()
     print("[BOT] Telegram polling started")
 
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 10000))
-    )
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
 if __name__ == "__main__":
     main()
